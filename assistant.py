@@ -1,9 +1,7 @@
 import base64
 import io
-import json
 import os
 import sys
-import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -83,6 +81,22 @@ class VoiceAssistant:
     def take_screenshot(self) -> Image.Image:
         return pyautogui.screenshot()
 
+    def check_ollama(self) -> tuple[bool, str]:
+        health_url = self.config.ollama_url.replace("/api/generate", "/api/tags")
+        try:
+            resp = requests.get(health_url, timeout=8)
+            resp.raise_for_status()
+            data = resp.json()
+            models = [m.get("name", "") for m in data.get("models", [])]
+            if not any(self.config.vision_model in model for model in models):
+                return (
+                    False,
+                    f"Ollama запущен, но модель '{self.config.vision_model}' не найдена. Выполни: ollama pull {self.config.vision_model}",
+                )
+            return True, "Ollama и модель готовы"
+        except Exception as exc:
+            return False, f"Не удалось подключиться к Ollama: {exc}"
+
     def ask_about_screen(self, question: str) -> str:
         image = self.take_screenshot()
         buffer = io.BytesIO()
@@ -103,6 +117,15 @@ class VoiceAssistant:
             return data.get("response", "Не удалось получить ответ от модели.").strip()
         except Exception as exc:
             return f"Ошибка при анализе экрана: {exc}"
+
+    @staticmethod
+    def _extract_screen_question(command: str) -> str:
+        prefixes = ("что на экране", "проанализируй экран")
+        for prefix in prefixes:
+            if command.startswith(prefix):
+                q = command[len(prefix):].strip(" .,!?")
+                return q if q else "Что находится на экране?"
+        return "Что находится на экране?"
 
     def handle_command(self, command: str) -> None:
         if command.startswith("открой окно"):
@@ -130,7 +153,11 @@ class VoiceAssistant:
             return
 
         if command.startswith("что на экране") or command.startswith("проанализируй экран"):
-            question = command.split(" ", 2)[-1] if " " in command else "Что находится на экране?"
+            ok, msg = self.check_ollama()
+            if not ok:
+                self.say(msg)
+                return
+            question = self._extract_screen_question(command)
             self.say("Анализирую экран")
             answer = self.ask_about_screen(question)
             self.say(answer)
@@ -170,10 +197,31 @@ def list_voices() -> None:
         print(f"id={voice.id} | name={voice.name}")
 
 
+def print_usage() -> None:
+    print("Использование:")
+    print("  python assistant.py")
+    print("  python assistant.py --list-voices")
+    print('  python assistant.py --ask-screen "что на экране"')
+
+
 if __name__ == "__main__":
+    assistant = VoiceAssistant()
+
     if "--list-voices" in sys.argv:
         list_voices()
         raise SystemExit(0)
 
-    assistant = VoiceAssistant()
+    if "--ask-screen" in sys.argv:
+        idx = sys.argv.index("--ask-screen")
+        if len(sys.argv) <= idx + 1:
+            print_usage()
+            raise SystemExit(1)
+        question = sys.argv[idx + 1].strip()
+        ok, msg = assistant.check_ollama()
+        if not ok:
+            print(msg)
+            raise SystemExit(2)
+        print(assistant.ask_about_screen(question))
+        raise SystemExit(0)
+
     assistant.run()

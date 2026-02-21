@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -49,15 +50,12 @@ class Config:
 
 
 class VoiceAssistant:
-    def __init__(
-        self,
-        config: Optional[Config] = None,
-        status_cb: Optional[Callable[[str], None]] = None,
-        log_cb: Optional[Callable[[str], None]] = None,
-    ) -> None:
+    def __init__(self, config: Optional[Config] = None, status_cb: Optional[Callable[[str], None]] = None, log_cb: Optional[Callable[[str], None]] = None) -> None:
         self.config = config or Config()
         self.status_cb = status_cb or (lambda _m: None)
         self.log_cb = log_cb or (lambda _m: None)
+
+        self.mode = "commands"  # commands | dialogue
 
         self._is_windows = platform.system() == "Windows"
         self.user32 = ctypes.windll.user32 if self._is_windows else None
@@ -85,14 +83,11 @@ class VoiceAssistant:
         if self.tts is None:
             return
         voices = self.tts.getProperty("voices")
-        selected = None
         for voice in voices:
             meta = f"{voice.name} {voice.id}".lower()
             if "ru" in meta or "russian" in meta or "рус" in meta:
-                selected = voice.id
+                self.tts.setProperty("voice", voice.id)
                 break
-        if selected:
-            self.tts.setProperty("voice", selected)
         self.tts.setProperty("rate", 170)
         self.tts.setProperty("volume", 1.0)
 
@@ -105,14 +100,7 @@ class VoiceAssistant:
             "$speak.Speak([Console]::In.ReadToEnd())"
         )
         try:
-            subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps_script],
-                input=text,
-                text=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps_script], input=text, text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
             return True
         except Exception:
             return False
@@ -131,7 +119,7 @@ class VoiceAssistant:
             except Exception:
                 self.tts = None
 
-        if self.config.speech_backend != "sapi" and pyttsx3 is not None and self.tts is None:
+        if self.config.speech_backend != "sapi" and pyttsx3 is not None:
             try:
                 self.tts = pyttsx3.init()
                 self._configure_voice()
@@ -167,18 +155,17 @@ class VoiceAssistant:
         self.status_cb(text)
         self.log_cb(f"[STATUS] {text}")
 
-    # ---------- windows discovery/control ----------
+    # ---------- windows ----------
     def _enumerate_windows_windows(self) -> list[dict]:
         if not self._is_windows:
             return []
 
-        windows: list[dict] = []
-        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        rows: list[dict] = []
+        cbtype = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
         def callback(hwnd: int, _lparam: int) -> bool:
             if not self.user32.IsWindowVisible(hwnd):
                 return True
-
             length = self.user32.GetWindowTextLengthW(hwnd)
             if length <= 0:
                 return True
@@ -192,8 +179,7 @@ class VoiceAssistant:
             pid = wintypes.DWORD()
             self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
 
-            process_name = ""
-            exe_path = ""
+            process_name, exe_path = "", ""
             if psutil is not None:
                 try:
                     proc = psutil.Process(pid.value)
@@ -202,46 +188,35 @@ class VoiceAssistant:
                 except Exception:
                     pass
 
-            windows.append(
-                {
-                    "window_id": int(hwnd),
-                    "pid": int(pid.value),
-                    "process": process_name,
-                    "exe": exe_path,
-                    "title": title,
-                }
-            )
+            rows.append({"window_id": int(hwnd), "pid": int(pid.value), "process": process_name, "exe": exe_path, "title": title})
             return True
 
-        self.user32.EnumWindows(WNDENUMPROC(callback), 0)
-        return windows
+        self.user32.EnumWindows(cbtype(callback), 0)
+        return rows
 
     def list_open_apps_detailed(self) -> list[dict]:
         return self._enumerate_windows_windows()
 
     def _find_best_window_entry(self, query: str) -> Optional[dict]:
-        query_n = self._normalize(query)
-        if not query_n:
+        q = self._normalize(query)
+        if not q:
             return None
 
         entries = self.list_open_apps_detailed()
         if not entries:
             return None
 
-        def score(entry: dict) -> int:
-            title = self._normalize(entry.get("title", ""))
-            process = self._normalize(entry.get("process", ""))
-            exe_name = self._normalize(Path(entry.get("exe", "")).name)
-            hay = [title, process, exe_name]
+        def score(e: dict) -> int:
+            fields = [self._normalize(e.get("title", "")), self._normalize(e.get("process", "")), self._normalize(Path(e.get("exe", "")).name)]
             s = 0
-            for field in hay:
-                if not field:
+            for f in fields:
+                if not f:
                     continue
-                if field == query_n:
+                if f == q:
                     s = max(s, 100)
-                elif query_n in field:
+                elif q in f:
                     s = max(s, 80)
-                elif any(tok and tok in field for tok in query_n.split()):
+                elif any(tok and tok in f for tok in q.split()):
                     s = max(s, 50)
             return s
 
@@ -252,56 +227,36 @@ class VoiceAssistant:
         if not self._is_windows:
             return False
         try:
-            self.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            self.user32.ShowWindow(hwnd, 9)
             return bool(self.user32.SetForegroundWindow(hwnd))
         except Exception:
             return False
 
     def activate_window(self, title_part: str) -> bool:
         entry = self._find_best_window_entry(title_part)
-        if entry and entry.get("window_id") and self._activate_hwnd_windows(entry["window_id"]):
-            return True
-
-        query_n = self._normalize(title_part)
-        for row in self.list_open_apps_detailed():
-            title_n = self._normalize(row.get("title", ""))
-            process_n = self._normalize(row.get("process", ""))
-            exe_n = self._normalize(Path(row.get("exe", "")).name)
-            if query_n and (query_n in title_n or query_n in process_n or query_n in exe_n):
-                if self._activate_hwnd_windows(row["window_id"]):
-                    return True
-        return False
+        return bool(entry and entry.get("window_id") and self._activate_hwnd_windows(entry["window_id"]))
 
     def close_window(self, title_part: str) -> bool:
         entry = self._find_best_window_entry(title_part)
-        if not entry:
+        if not entry or not entry.get("window_id"):
             return False
-        hwnd = entry.get("window_id")
-        if not hwnd:
-            return False
-
-        WM_CLOSE = 0x0010
         try:
-            self.user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+            self.user32.PostMessageW(entry["window_id"], 0x0010, 0, 0)
             return True
         except Exception:
             return False
 
-    # ---------- app launching ----------
+    # ---------- desktop launch ----------
     def _desktop_shortcuts(self) -> list[Path]:
         paths = []
-        userprofile = os.environ.get("USERPROFILE", "")
-        if userprofile:
-            paths.append(Path(userprofile) / "Desktop")
-        public = os.environ.get("PUBLIC", r"C:\Users\Public")
-        paths.append(Path(public) / "Desktop")
+        if os.environ.get("USERPROFILE"):
+            paths.append(Path(os.environ["USERPROFILE"]) / "Desktop")
+        paths.append(Path(os.environ.get("PUBLIC", r"C:\Users\Public")) / "Desktop")
 
-        files = []
+        files: list[Path] = []
         for d in paths:
             if d.exists():
-                files.extend(sorted(d.glob("*.lnk")))
-                files.extend(sorted(d.glob("*.url")))
-                files.extend(sorted(d.glob("*.exe")))
+                files += sorted(d.glob("*.lnk")) + sorted(d.glob("*.url")) + sorted(d.glob("*.exe"))
         return files
 
     def launch_application(self, app_name: str) -> tuple[bool, str]:
@@ -310,40 +265,31 @@ class VoiceAssistant:
             return False, "Не указано имя приложения"
 
         q = self._normalize(app_name)
-        shortcuts = self._desktop_shortcuts()
-        if not shortcuts:
-            return False, "На рабочем столе не найдены ярлыки для запуска"
+        options = self._desktop_shortcuts()
+        if not options:
+            return False, "На рабочем столе не найдены ярлыки/программы"
 
-        best = None
-        best_score = 0
-        for item in shortcuts:
-            stem_n = self._normalize(item.stem)
-            score = 0
-            if stem_n == q:
-                score = 100
-            elif q in stem_n:
-                score = 80
-            elif any(tok and tok in stem_n for tok in q.split()):
-                score = 50
+        best, best_score = None, 0
+        for f in options:
+            stem = self._normalize(f.stem)
+            score = 100 if stem == q else 80 if q in stem else 50 if any(tok and tok in stem for tok in q.split()) else 0
             if score > best_score:
-                best = item
-                best_score = score
+                best, best_score = f, score
 
         if best is None:
-            return False, f"Не нашел приложение '{app_name}' на рабочем столе"
+            return False, f"Не нашел '{app_name}' на рабочем столе"
 
         try:
             os.startfile(str(best))  # type: ignore[attr-defined]
-            return True, f"Запускаю {best.stem} с рабочего стола"
+            return True, f"Запускаю {best.stem}"
         except Exception as exc:
-            return False, f"Не удалось запустить '{best.stem}': {exc}"
+            return False, f"Не удалось запустить {best.stem}: {exc}"
 
     # ---------- typing ----------
     def type_text(self, text: str) -> bool:
         if not text or pyautogui is None:
             return False
 
-        # 1) paste from clipboard
         if pyperclip is not None:
             try:
                 pyperclip.copy(text)
@@ -352,7 +298,6 @@ class VoiceAssistant:
             except Exception:
                 pass
 
-        # 2) fallback direct typing
         try:
             pyautogui.write(text, interval=0.01)
             return True
@@ -367,7 +312,6 @@ class VoiceAssistant:
                 pyautogui.hotkey("ctrl", "a")
                 pyautogui.press("backspace")
             else:
-                # delete recent typed fragment quickly
                 pyautogui.hotkey("ctrl", "shift", "left")
                 pyautogui.press("backspace")
             return True
@@ -378,10 +322,6 @@ class VoiceAssistant:
         if pyautogui is not None:
             pyautogui.press("enter")
 
-    def press_hotkey(self, *keys: str) -> None:
-        if pyautogui is not None:
-            pyautogui.hotkey(*keys)
-
     # ---------- LM Studio ----------
     def _check_http_client(self) -> tuple[bool, str]:
         if requests is None:
@@ -389,10 +329,7 @@ class VoiceAssistant:
         return True, "ok"
 
     def _lmstudio_headers(self) -> dict:
-        return {
-            "Authorization": f"Bearer {self.config.lmstudio_api_key}",
-            "Content-Type": "application/json",
-        }
+        return {"Authorization": f"Bearer {self.config.lmstudio_api_key}", "Content-Type": "application/json"}
 
     def _candidate_lmstudio_base_urls(self) -> list[str]:
         configured = self.config.lmstudio_base_url.rstrip("/")
@@ -405,34 +342,28 @@ class VoiceAssistant:
             "http://localhost:1234",
             "http://127.0.0.1:8080/v1",
             "http://localhost:8080/v1",
-            "http://127.0.0.1:3000/v1",
-            "http://localhost:3000/v1",
         ]
-        uniq = []
-        for u in raw:
-            if u and u not in uniq:
-                uniq.append(u)
-        return uniq
+        return list(dict.fromkeys([u for u in raw if u]))
 
     @staticmethod
     def _normalize_base_with_v1(base: str) -> str:
         b = base.rstrip("/")
         return b if b.endswith("/v1") else f"{b}/v1"
 
-    def _try_lmstudio_models_request(self, base_v1: str) -> Optional[dict]:
+    def _try_models_request(self, base_v1: str) -> bool:
         assert requests is not None
-        url = base_v1.rstrip("/") + "/models"
+        url = base_v1 + "/models"
         for headers in (self._lmstudio_headers(), {"Content-Type": "application/json"}):
             try:
                 resp = requests.get(url, headers=headers, timeout=2.5)
                 if resp.status_code >= 400:
                     continue
                 data = resp.json()
-                if isinstance(data, dict) and isinstance(data.get("data", None), list):
-                    return data
+                if isinstance(data, dict) and isinstance(data.get("data"), list):
+                    return True
             except Exception:
                 continue
-        return None
+        return False
 
     def _discover_lmstudio_base_url(self) -> tuple[bool, str]:
         ok, msg = self._check_http_client()
@@ -443,27 +374,25 @@ class VoiceAssistant:
             return True, self._resolved_lmstudio_base_url
 
         assert requests is not None
-        for candidate in self._candidate_lmstudio_base_urls():
-            normalized = self._normalize_base_with_v1(candidate)
-            data = self._try_lmstudio_models_request(normalized)
-            if data is not None:
-                self._resolved_lmstudio_base_url = normalized
-                self.log_cb(f"[INFO] LM Studio найден: {normalized}")
-                return True, normalized
+        for c in self._candidate_lmstudio_base_urls():
+            n = self._normalize_base_with_v1(c)
+            if self._try_models_request(n):
+                self._resolved_lmstudio_base_url = n
+                self.log_cb(f"[INFO] LM Studio найден: {n}")
+                return True, n
 
-        return False, "Не удалось автоматически найти LM Studio. Включи Local Server в LM Studio"
+        return False, "Не удалось найти LM Studio. Включи Local Server"
 
     def _lmstudio_url(self, path: str) -> str:
         base = (self._resolved_lmstudio_base_url or self._normalize_base_with_v1(self.config.lmstudio_base_url)).rstrip("/")
         return base + path
 
     def check_lmstudio(self) -> tuple[bool, str]:
-        found, discover_msg = self._discover_lmstudio_base_url()
+        found, msg = self._discover_lmstudio_base_url()
         if not found:
-            return False, discover_msg
-
-        assert requests is not None
+            return False, msg
         try:
+            assert requests is not None
             resp = requests.get(self._lmstudio_url("/models"), headers=self._lmstudio_headers(), timeout=8)
             if resp.status_code >= 400:
                 resp = requests.get(self._lmstudio_url("/models"), headers={"Content-Type": "application/json"}, timeout=8)
@@ -473,43 +402,67 @@ class VoiceAssistant:
                 return False, "LM Studio найден, но нет загруженных моделей"
             return True, f"LM Studio готов ({self._resolved_lmstudio_base_url}). Моделей: {len(models)}"
         except Exception as exc:
-            return False, f"LM Studio найден, но запрос не прошел: {exc}"
+            return False, f"Ошибка доступа к LM Studio: {exc}"
 
-    def _get_active_lmstudio_model(self) -> Optional[str]:
+    def _get_active_model(self) -> Optional[str]:
         found, _ = self._discover_lmstudio_base_url()
         if not found or requests is None:
             return None
-
         resp = requests.get(self._lmstudio_url("/models"), headers=self._lmstudio_headers(), timeout=8)
         if resp.status_code >= 400:
             resp = requests.get(self._lmstudio_url("/models"), headers={"Content-Type": "application/json"}, timeout=8)
         resp.raise_for_status()
-        models = resp.json().get("data", [])
-        if not models:
-            return None
-        return models[0].get("id")
+        data = resp.json().get("data", [])
+        return data[0].get("id") if data else None
 
-    def ask_ai(self, question: str, image_b64: Optional[str] = None) -> str:
+    def _extract_last_answer(self, text: str) -> str:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            return "Ответ в LM Studio не найден"
+        return lines[-1]
+
+    def ask_ai_via_lmstudio_window(self, question: str) -> str:
+        if pyautogui is None or pyperclip is None:
+            return "Для ручного режима нужен pyautogui и pyperclip"
+
+        if not self.activate_window("lm studio"):
+            return "Не удалось активировать окно LM Studio"
+
         try:
-            model_id = self._get_active_lmstudio_model()
-            if not model_id:
+            time.sleep(0.35)
+            pyperclip.copy(question)
+            pyautogui.hotkey("ctrl", "v")
+            pyautogui.press("enter")
+            self.log_cb("[INFO] Запрос отправлен в окно LM Studio")
+
+            # Попытка автоматически прочитать ответ из выделенного текста в окне
+            time.sleep(5.0)
+            pyautogui.hotkey("ctrl", "a")
+            time.sleep(0.1)
+            pyautogui.hotkey("ctrl", "c")
+            time.sleep(0.1)
+            return self._extract_last_answer(pyperclip.paste())
+        except Exception as exc:
+            return f"Ручной режим LM Studio не удался: {exc}"
+
+    def ask_ai_api(self, question: str, image_b64: Optional[str] = None) -> str:
+        try:
+            model = self._get_active_model()
+            if not model:
                 return "В LM Studio нет активной модели"
 
-            endpoint = self._lmstudio_url("/chat/completions")
-            if image_b64:
-                content = [
-                    {
-                        "type": "text",
-                        "text": "Отвечай по-русски, кратко и по содержимому изображения. " f"Вопрос: {question}",
-                    },
+            content = (
+                [
+                    {"type": "text", "text": f"Отвечай по-русски, кратко. Вопрос: {question}"},
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
                 ]
-            else:
-                content = "Ты помощник Вовчик. Отвечай по-русски, понятно и полезно. Вопрос: " + question
-
-            payload = {"model": model_id, "messages": [{"role": "user", "content": content}], "temperature": 0.3}
+                if image_b64
+                else f"Ты помощник Вовчик. Отвечай по-русски, полезно и кратко. Вопрос: {question}"
+            )
+            payload = {"model": model, "messages": [{"role": "user", "content": content}], "temperature": 0.3}
 
             assert requests is not None
+            endpoint = self._lmstudio_url("/chat/completions")
             resp = requests.post(endpoint, headers=self._lmstudio_headers(), json=payload, timeout=120)
             if resp.status_code >= 400:
                 resp = requests.post(endpoint, headers={"Content-Type": "application/json"}, json=payload, timeout=120)
@@ -517,41 +470,43 @@ class VoiceAssistant:
             data = resp.json()
             message = data.get("choices", [{}])[0].get("message", {}).get("content", "")
             if isinstance(message, list):
-                chunks = [p.get("text", "") for p in message if isinstance(p, dict) and p.get("type") == "text"]
-                message = "\n".join(chunks)
-            answer = str(message).strip()
-            return answer or "Модель не вернула ответ"
+                message = "\n".join([p.get("text", "") for p in message if isinstance(p, dict) and p.get("type") == "text"])
+            return str(message).strip() or "Модель не вернула ответ"
         except Exception as exc:
-            return f"Ошибка обращения к LM Studio: {exc}"
+            return f"Ошибка API LM Studio: {exc}"
 
     def ask_about_screen(self, question: str) -> str:
         if pyautogui is None:
             return "Модуль pyautogui не установлен"
         try:
-            image = pyautogui.screenshot()
-            buffer = io.BytesIO()
-            image.save(buffer, format="PNG")
-            img_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-            return self.ask_ai(question, image_b64=img_b64)
+            img = pyautogui.screenshot()
+            buff = io.BytesIO()
+            img.save(buff, format="PNG")
+            return self.ask_ai_api(question, base64.b64encode(buff.getvalue()).decode("utf-8"))
         except Exception as exc:
-            return f"Ошибка при создании скриншота: {exc}"
+            return f"Ошибка скриншота: {exc}"
 
-    # ---------- intents ----------
+    # ---------- intent parsing ----------
     @staticmethod
     def _clean_phrase(text: str) -> str:
         return re.sub(r"\s+", " ", text.lower()).strip()
 
     @staticmethod
     def _extract_text_after_keywords(command: str, keywords: list[str]) -> str:
-        for keyword in keywords:
-            if keyword in command:
-                suffix = command.split(keyword, 1)[1].strip(" .,!?:;-")
+        for kw in keywords:
+            if kw in command:
+                suffix = command.split(kw, 1)[1].strip(" .,!?:;-")
                 if suffix:
                     return suffix
         return ""
 
     def _parse_intent(self, command: str) -> tuple[str, str]:
         c = self._clean_phrase(command)
+
+        if "режим диалога" in c:
+            return "mode_dialogue", ""
+        if "режим команд" in c:
+            return "mode_commands", ""
 
         if any(w in c for w in ["выход", "стоп", "заверш", "закрой ассистента", "выключи бота"]):
             return "exit", ""
@@ -562,8 +517,7 @@ class VoiceAssistant:
         if any(w in c for w in ["закрой окно", "закрой приложение"]):
             return "close_window", self._extract_text_after_keywords(c, ["закрой окно", "закрой приложение"])
         if any(w in c for w in ["стер", "удали текст", "очисти текст", "сотри"]):
-            mode = "all" if "весь" in c or "полностью" in c else "line"
-            return "erase_text", mode
+            return "erase_text", "all" if "весь" in c or "полностью" in c else "line"
         if any(w in c for w in ["отправ", "send", "вышли"]):
             return "send", ""
         if any(w in c for w in ["экран", "скрин", "что видишь", "анализ"]):
@@ -571,8 +525,8 @@ class VoiceAssistant:
             return "screen", q or "Что находится на экране?"
         if any(w in c for w in ["переключ", "активируй", "открой окно", "сфокусируй"]):
             return "window", self._extract_text_after_keywords(c, ["открой окно", "переключись на", "активируй", "сфокусируй", "открой"])
-        if any(w in c for w in ["напечат", "введи", "впиши", "набери"]):
-            return "type", self._extract_text_after_keywords(c, ["напечатай", "введи", "впиши", "набери"])
+        if any(w in c for w in ["напечат", "введи", "впиши", "набери", "напиши", "печатай"]):
+            return "type", self._extract_text_after_keywords(c, ["напечатай", "введи", "впиши", "набери", "напиши", "печатай"])
         if any(w in c for w in ["нажми", "горяч", "комбинац"]):
             return "hotkey", self._extract_text_after_keywords(c, ["нажми", "комбинацию", "горячие клавиши"])
         return "ask_ai", c
@@ -580,18 +534,24 @@ class VoiceAssistant:
     def handle_command(self, command: str) -> None:
         intent, value = self._parse_intent(command)
 
+        if intent == "mode_dialogue":
+            self.mode = "dialogue"
+            self.say("Включил режим диалога")
+            self._set_status("Режим: диалог")
+            return
+
+        if intent == "mode_commands":
+            self.mode = "commands"
+            self.say("Включил режим команд")
+            self._set_status("Режим: команды")
+            return
+
         if intent == "window":
-            if value and self.activate_window(value):
-                self.say(f"Окно {value} активировано")
-            else:
-                self.say("Не удалось активировать окно. Скажи точнее название")
+            self.say(f"Окно {value} активировано" if value and self.activate_window(value) else "Не удалось активировать окно")
             return
 
         if intent == "close_window":
-            if value and self.close_window(value):
-                self.say(f"Окно {value} закрыто")
-            else:
-                self.say("Не удалось закрыть выбранное окно")
+            self.say(f"Окно {value} закрыто" if value and self.close_window(value) else "Не удалось закрыть выбранное окно")
             return
 
         if intent == "launch_app":
@@ -605,17 +565,12 @@ class VoiceAssistant:
                 self.say("Не вижу открытых окон")
             else:
                 self.say(f"Нашел {len(apps)} окон. Показал в логе")
-                for idx, item in enumerate(apps, start=1):
-                    self.log_cb(
-                        f"[APP {idx}] title='{item.get('title','')}' process='{item.get('process','')}' exe='{Path(item.get('exe','')).name}' pid={item.get('pid')}"
-                    )
+                for i, item in enumerate(apps, 1):
+                    self.log_cb(f"[APP {i}] title='{item.get('title','')}' process='{item.get('process','')}' exe='{Path(item.get('exe','')).name}' pid={item.get('pid')}")
             return
 
         if intent == "type":
-            if not value:
-                self.say("Не расслышал текст для ввода")
-            else:
-                self.say("Текст вставлен" if self.type_text(value) else "Не удалось ввести текст")
+            self.say("Текст вставлен" if value and self.type_text(value) else "Не удалось ввести текст")
             return
 
         if intent == "erase_text":
@@ -628,12 +583,15 @@ class VoiceAssistant:
             return
 
         if intent == "hotkey":
-            keys = tuple(part.strip() for part in value.split("+") if part.strip())
+            if pyautogui is None:
+                self.say("pyautogui не установлен")
+                return
+            keys = tuple(p.strip() for p in value.split("+") if p.strip())
             if keys:
-                self.press_hotkey(*keys)
+                pyautogui.hotkey(*keys)
                 self.say("Сделано")
             else:
-                self.say("Не понял комбинацию клавиш")
+                self.say("Не понял комбинацию")
             return
 
         if intent == "screen":
@@ -643,24 +601,31 @@ class VoiceAssistant:
                 return
             self._set_status("Анализирую экран...")
             self.say(self.ask_about_screen(value))
-            self._set_status("Готов к командам")
+            self._set_status("Готов")
             return
 
         if intent == "ask_ai":
-            ok, msg = self.check_lmstudio()
-            if not ok:
-                self.say(msg)
+            if self.mode != "dialogue":
+                self.say("Сейчас режим команд. Скажи: режим диалога")
                 return
-            self._set_status("Думаю...")
-            self.say(self.ask_ai(value))
-            self._set_status("Готов к командам")
+
+            # В режиме диалога сначала отправляем вручную в окно LM Studio, как просили.
+            self._set_status("Режим диалога: запрос в LM Studio")
+            answer = self.ask_ai_via_lmstudio_window(value)
+            if answer.startswith("Не удалось") or answer.startswith("Для ручного") or answer.startswith("Ручной режим"):
+                ok, msg = self.check_lmstudio()
+                if ok:
+                    answer = self.ask_ai_api(value)
+                else:
+                    answer = f"{answer}. Плюс нет API подключения: {msg}"
+            self.say(answer)
+            self._set_status("Готов")
             return
 
         if intent == "exit":
             self.say("Останавливаюсь")
             self.stop()
 
-    # ---------- runtime ----------
     def _loop(self) -> None:
         self._set_status("Слушаю")
         self.say("Бот запущен")
@@ -671,8 +636,8 @@ class VoiceAssistant:
                     break
                 if not heard:
                     continue
-
                 self.log_cb(f"[YOU] {heard}")
+
                 if self.config.wake_word in heard:
                     heard = heard.replace(self.config.wake_word, "", 1).strip()
                     if not heard:
@@ -684,7 +649,6 @@ class VoiceAssistant:
                     self.handle_command(heard)
             except Exception as exc:
                 self.log_cb(f"[ERR] {exc}")
-
         self._set_status("Остановлен")
 
     def start(self) -> None:
@@ -709,7 +673,7 @@ class BotControlUI:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title("Вовчик — статус")
-        self.root.geometry("840x520")
+        self.root.geometry("860x540")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -728,30 +692,16 @@ class BotControlUI:
         self._btn(row, "Стоп", self.stop_bot).pack(side="left", padx=4)
         self._btn(row, "Выход", self.on_close).pack(side="left", padx=4)
 
-        hint = (
-            "Команды: 'список открытых приложений', 'запусти <ярлык с рабочего стола>', "
-            "'переключись на ...', 'закрой окно ...', 'напечатай ...', 'сотри текст', 'отправь'."
-        )
-        tk.Label(container, text=hint, bg=self.CARD, fg=self.SUB, wraplength=790, justify="left").pack(anchor="w", padx=14)
+        hint = "Команды: режим диалога/режим команд, запусти <ярлык>, закрой окно <имя>, напечатай, сотри текст, отправь."
+        tk.Label(container, text=hint, bg=self.CARD, fg=self.SUB, wraplength=810, justify="left").pack(anchor="w", padx=14)
 
         tk.Label(container, text="Лог", bg=self.CARD, fg=self.SUB, font=("Segoe UI", 9)).pack(anchor="w", padx=14, pady=(8, 2))
-        self.log_widget = tk.Text(
-            container,
-            height=20,
-            wrap="word",
-            bg="#0f1115",
-            fg="#d1d5db",
-            insertbackground="#d1d5db",
-            relief="flat",
-            bd=0,
-            highlightthickness=1,
-            highlightbackground="#2f3540",
-            highlightcolor="#2f3540",
-        )
+        self.log_widget = tk.Text(container, height=20, wrap="word", bg="#0f1115", fg="#d1d5db", insertbackground="#d1d5db", relief="flat", bd=0, highlightthickness=1, highlightbackground="#2f3540")
         self.log_widget.pack(fill="both", expand=True, padx=14, pady=(0, 14))
 
         self.assistant = VoiceAssistant(status_cb=self.set_status, log_cb=self.append_log)
-        self.set_status("Готов. Нажми 'Старт' для запуска микрофона")
+        self.set_status("Готов. Нажми 'Старт'")
+
         missing = []
         if requests is None:
             missing.append("requests")
@@ -759,39 +709,19 @@ class BotControlUI:
             missing.append("speech_recognition")
         if pyautogui is None:
             missing.append("pyautogui")
-        if pyperclip is None:
-            missing.append("pyperclip")
         if missing:
             self.append_log("[WARN] Не установлены модули: " + ", ".join(missing) + ". Выполни: pip install -r requirements.txt")
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _btn(self, parent: tk.Widget, text: str, command: Callable[[], None]) -> tk.Button:
-        return tk.Button(
-            parent,
-            text=text,
-            command=command,
-            bg=self.BTN,
-            fg=self.FG,
-            activebackground="#384152",
-            activeforeground=self.FG,
-            relief="flat",
-            bd=0,
-            padx=14,
-            pady=8,
-            font=("Segoe UI", 10, "bold"),
-            cursor="hand2",
-        )
+        return tk.Button(parent, text=text, command=command, bg=self.BTN, fg=self.FG, activebackground="#384152", activeforeground=self.FG, relief="flat", bd=0, padx=14, pady=8, font=("Segoe UI", 10, "bold"), cursor="hand2")
 
     def set_status(self, text: str) -> None:
         self.root.after(0, lambda: self.status_var.set(text))
 
     def append_log(self, text: str) -> None:
-        def _append() -> None:
-            self.log_widget.insert("end", text + "\n")
-            self.log_widget.see("end")
-
-        self.root.after(0, _append)
+        self.root.after(0, lambda: (self.log_widget.insert("end", text + "\n"), self.log_widget.see("end")))
 
     def start_bot(self) -> None:
         self.assistant.start()
@@ -814,25 +744,23 @@ def list_voices() -> None:
         print("pyttsx3 не установлен")
         return
     tts = pyttsx3.init()
-    for voice in tts.getProperty("voices"):
-        print(f"id={voice.id} | name={voice.name}")
+    for v in tts.getProperty("voices"):
+        print(f"id={v.id} | name={v.name}")
 
 
 def print_usage() -> None:
     print("Использование:")
     print("  python assistant.py")
     print("  python assistant.py --list-voices")
-    print('  python assistant.py --ask-screen "что на экране"')
     print('  python assistant.py --ask "любой вопрос"')
+    print('  python assistant.py --ask-screen "что на экране"')
 
 
 def parse_cli_value(flag: str) -> Optional[str]:
     if flag not in sys.argv:
         return None
-    idx = sys.argv.index(flag)
-    if len(sys.argv) <= idx + 1:
-        return None
-    return sys.argv[idx + 1].strip()
+    i = sys.argv.index(flag)
+    return sys.argv[i + 1].strip() if len(sys.argv) > i + 1 else None
 
 
 if __name__ == "__main__":
@@ -840,31 +768,30 @@ if __name__ == "__main__":
         list_voices()
         raise SystemExit(0)
 
-    if "--ask-screen" in sys.argv:
-        assistant = VoiceAssistant()
-        question = parse_cli_value("--ask-screen")
-        if not question:
-            print_usage()
-            raise SystemExit(1)
-        ok, msg = assistant.check_lmstudio()
-        if not ok:
-            print(msg)
-            raise SystemExit(2)
-        print(assistant.ask_about_screen(question))
-        raise SystemExit(0)
-
     if "--ask" in sys.argv:
-        assistant = VoiceAssistant()
-        question = parse_cli_value("--ask")
-        if not question:
+        q = parse_cli_value("--ask")
+        if not q:
             print_usage()
             raise SystemExit(1)
-        ok, msg = assistant.check_lmstudio()
+        a = VoiceAssistant()
+        ok, msg = a.check_lmstudio()
         if not ok:
             print(msg)
             raise SystemExit(2)
-        print(assistant.ask_ai(question))
+        print(a.ask_ai_api(q))
         raise SystemExit(0)
 
-    ui = BotControlUI()
-    ui.run()
+    if "--ask-screen" in sys.argv:
+        q = parse_cli_value("--ask-screen")
+        if not q:
+            print_usage()
+            raise SystemExit(1)
+        a = VoiceAssistant()
+        ok, msg = a.check_lmstudio()
+        if not ok:
+            print(msg)
+            raise SystemExit(2)
+        print(a.ask_about_screen(q))
+        raise SystemExit(0)
+
+    BotControlUI().run()

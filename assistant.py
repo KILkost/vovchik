@@ -56,6 +56,7 @@ class VoiceAssistant:
         self.log_cb = log_cb or (lambda _m: None)
 
         self.mode = "commands"  # commands | dialogue
+        self._last_typed_text = ""
 
         self._is_windows = platform.system() == "Windows"
         self.user32 = ctypes.windll.user32 if self._is_windows else None
@@ -290,10 +291,17 @@ class VoiceAssistant:
         if not text or pyautogui is None:
             return False
 
+        self._last_typed_text = text
+
         if pyperclip is not None:
             try:
                 pyperclip.copy(text)
                 pyautogui.hotkey("ctrl", "v")
+                return True
+            except Exception:
+                pass
+            try:
+                pyautogui.hotkey("shift", "insert")
                 return True
             except Exception:
                 pass
@@ -311,10 +319,25 @@ class VoiceAssistant:
             if mode == "all":
                 pyautogui.hotkey("ctrl", "a")
                 pyautogui.press("backspace")
-            else:
+                self._last_typed_text = ""
+                return True
+
+            # line mode: first try word-select delete
+            try:
                 pyautogui.hotkey("ctrl", "shift", "left")
                 pyautogui.press("backspace")
-            return True
+                self._last_typed_text = ""
+                return True
+            except Exception:
+                pass
+
+            # robust fallback: delete by length of last typed text
+            if self._last_typed_text:
+                for _ in range(len(self._last_typed_text)):
+                    pyautogui.press("backspace")
+                self._last_typed_text = ""
+                return True
+            return False
         except Exception:
             return False
 
@@ -510,14 +533,14 @@ class VoiceAssistant:
 
         if any(w in c for w in ["выход", "стоп", "заверш", "закрой ассистента", "выключи бота"]):
             return "exit", ""
-        if any(w in c for w in ["список окон", "какие окна", "открытые приложения", "список приложений"]):
+        if any(w in c for w in ["список окон", "какие окна", "открытые приложения", "открытых приложений", "список приложений"]):
             return "list_apps", ""
         if any(w in c for w in ["запусти", "стартуй", "открой приложение"]):
             return "launch_app", self._extract_text_after_keywords(c, ["запусти", "стартуй", "открой приложение"])
         if any(w in c for w in ["закрой окно", "закрой приложение"]):
             return "close_window", self._extract_text_after_keywords(c, ["закрой окно", "закрой приложение"])
-        if any(w in c for w in ["стер", "удали текст", "очисти текст", "сотри"]):
-            return "erase_text", "all" if "весь" in c or "полностью" in c else "line"
+        if any(w in c for w in ["стер", "стереть", "удали текст", "очисти текст", "сотри", "сотри весь текст", "удали весь текст", "очисти всё"]):
+            return "erase_text", "all" if ("весь" in c or "все" in c or "всё" in c or "полностью" in c) else "line"
         if any(w in c for w in ["отправ", "send", "вышли"]):
             return "send", ""
         if any(w in c for w in ["экран", "скрин", "что видишь", "анализ"]):
@@ -609,15 +632,21 @@ class VoiceAssistant:
                 self.say("Сейчас режим команд. Скажи: режим диалога")
                 return
 
-            # В режиме диалога сначала отправляем вручную в окно LM Studio, как просили.
-            self._set_status("Режим диалога: запрос в LM Studio")
-            answer = self.ask_ai_via_lmstudio_window(value)
-            if answer.startswith("Не удалось") or answer.startswith("Для ручного") or answer.startswith("Ручной режим"):
-                ok, msg = self.check_lmstudio()
-                if ok:
-                    answer = self.ask_ai_api(value)
-                else:
-                    answer = f"{answer}. Плюс нет API подключения: {msg}"
+            # В режиме диалога сперва пробуем системный API путь LM Studio.
+            self._set_status("Режим диалога: API запрос")
+            ok, msg = self.check_lmstudio()
+            if ok:
+                answer = self.ask_ai_api(value)
+                if answer.startswith("Ошибка API") or answer.startswith("В LM Studio нет"):
+                    self._set_status("API не сработал, пробую ручной режим")
+                    manual = self.ask_ai_via_lmstudio_window(value)
+                    answer = manual if not manual.startswith("Не удалось") else f"{answer}. {manual}"
+            else:
+                self._set_status("API недоступен, пробую ручной режим")
+                answer = self.ask_ai_via_lmstudio_window(value)
+                if answer.startswith("Не удалось"):
+                    answer = f"Нет API подключения: {msg}. {answer}"
+
             self.say(answer)
             self._set_status("Готов")
             return

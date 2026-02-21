@@ -73,6 +73,7 @@ class VoiceAssistant:
 
         self._run_event = threading.Event()
         self._worker: Optional[threading.Thread] = None
+        self._resolved_lmstudio_base_url: Optional[str] = None
 
     def _init_tts(self) -> None:
         if self.config.speech_backend == "sapi":
@@ -345,25 +346,81 @@ class VoiceAssistant:
         }
 
     def _lmstudio_url(self, path: str) -> str:
-        return self.config.lmstudio_base_url.rstrip("/") + path
+        base = (self._resolved_lmstudio_base_url or self.config.lmstudio_base_url).rstrip("/")
+        return base + path
+
+    def _candidate_lmstudio_base_urls(self) -> list[str]:
+        configured = self.config.lmstudio_base_url.rstrip("/")
+        raw_candidates = [
+            configured,
+            configured.replace("/v1", ""),
+            "http://127.0.0.1:1234/v1",
+            "http://localhost:1234/v1",
+            "http://127.0.0.1:1234",
+            "http://localhost:1234",
+            "http://127.0.0.1:8080/v1",
+            "http://localhost:8080/v1",
+            "http://127.0.0.1:3000/v1",
+            "http://localhost:3000/v1",
+        ]
+        # unique preserve order
+        result = []
+        for url in raw_candidates:
+            if url and url not in result:
+                result.append(url)
+        return result
+
+    def _normalize_base_with_v1(self, base_url: str) -> str:
+        b = base_url.rstrip("/")
+        return b if b.endswith("/v1") else f"{b}/v1"
+
+    def _discover_lmstudio_base_url(self) -> tuple[bool, str]:
+        if requests is None:
+            return False, "Модуль requests не установлен. Выполни: pip install -r requirements.txt"
+
+        for candidate in self._candidate_lmstudio_base_urls():
+            normalized = self._normalize_base_with_v1(candidate)
+            models_url = normalized + "/models"
+            try:
+                resp = requests.get(models_url, headers=self._lmstudio_headers(), timeout=2.5)
+                if resp.status_code >= 400:
+                    continue
+                data = resp.json()
+                if isinstance(data, dict) and isinstance(data.get("data", None), list):
+                    self._resolved_lmstudio_base_url = normalized
+                    self.log_cb(f"[INFO] LM Studio найден: {normalized}")
+                    return True, normalized
+            except Exception:
+                continue
+
+        return False, "Не удалось автоматически найти LM Studio. Проверь, что Local Server включен в LM Studio"
 
     def check_lmstudio(self) -> tuple[bool, str]:
         ok, msg = self._check_http_client()
         if not ok:
             return False, msg
+
+        found, discover_msg = self._discover_lmstudio_base_url()
+        if not found:
+            return False, discover_msg
+
         try:
             resp = requests.get(self._lmstudio_url("/models"), headers=self._lmstudio_headers(), timeout=8)
             resp.raise_for_status()
             models = resp.json().get("data", [])
             if not models:
-                return False, "LM Studio доступен, но нет загруженных моделей"
-            return True, f"LM Studio готов. Моделей: {len(models)}"
+                return False, "LM Studio найден, но нет загруженных моделей"
+            return True, f"LM Studio готов ({self._resolved_lmstudio_base_url}). Моделей: {len(models)}"
         except Exception as exc:
-            return False, f"Не удалось подключиться к LM Studio: {exc}"
+            return False, f"LM Studio найден, но запрос не прошел: {exc}"
 
     def _get_active_lmstudio_model(self) -> Optional[str]:
         if requests is None:
             return None
+        if self._resolved_lmstudio_base_url is None:
+            found, _ = self._discover_lmstudio_base_url()
+            if not found:
+                return None
         resp = requests.get(self._lmstudio_url("/models"), headers=self._lmstudio_headers(), timeout=8)
         resp.raise_for_status()
         models = resp.json().get("data", [])

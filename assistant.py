@@ -1,12 +1,16 @@
 import base64
 import io
 import os
+import re
+import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Optional
 
 import pyautogui
 import pygetwindow as gw
+import pyperclip
 import pyttsx3
 import requests
 import speech_recognition as sr
@@ -29,7 +33,6 @@ class VoiceAssistant:
         self._configure_voice()
 
     def _configure_voice(self) -> None:
-        """Выбор наиболее подходящего русского голоса."""
         voices = self.tts.getProperty("voices")
         selected = None
         for voice in voices:
@@ -46,8 +49,14 @@ class VoiceAssistant:
 
     def say(self, text: str) -> None:
         print(f"[BOT] {text}")
-        self.tts.say(text)
-        self.tts.runAndWait()
+        try:
+            self.tts.say(text)
+            self.tts.runAndWait()
+        except Exception:
+            self.tts = pyttsx3.init()
+            self._configure_voice()
+            self.tts.say(text)
+            self.tts.runAndWait()
 
     def listen(self, timeout: int = 5, phrase_time_limit: int = 8) -> str:
         with sr.Microphone() as source:
@@ -55,25 +64,55 @@ class VoiceAssistant:
             audio = self.recognizer.listen(source, timeout=timeout, phrase_time_limit=phrase_time_limit)
 
         try:
-            return self.recognizer.recognize_google(audio, language=self.config.language).lower()
+            return self.recognizer.recognize_google(audio, language=self.config.language).lower().strip()
         except sr.UnknownValueError:
             return ""
         except sr.RequestError:
-            self.say("Не удалось обратиться к сервису распознавания.")
+            self.say("Не удалось обратиться к сервису распознавания")
             return ""
 
+    @staticmethod
+    def _clean_phrase(text: str) -> str:
+        return re.sub(r"\s+", " ", text.lower()).strip()
+
     def activate_window(self, title_part: str) -> bool:
-        windows = gw.getWindowsWithTitle(title_part)
-        if not windows:
+        if not title_part:
             return False
-        target = windows[0]
-        if target.isMinimized:
-            target.restore()
-        target.activate()
-        return True
+
+        # 1) Попытка через pygetwindow.
+        try:
+            windows = gw.getWindowsWithTitle(title_part)
+            if windows:
+                target = windows[0]
+                if target.isMinimized:
+                    target.restore()
+                target.activate()
+                return True
+        except Exception:
+            pass
+
+        # 2) Linux fallback через wmctrl/xdotool.
+        if shutil.which("wmctrl"):
+            proc = subprocess.run(["wmctrl", "-a", title_part], capture_output=True, text=True)
+            if proc.returncode == 0:
+                return True
+
+        if shutil.which("xdotool"):
+            proc = subprocess.run(
+                ["xdotool", "search", "--name", title_part, "windowactivate"],
+                capture_output=True,
+                text=True,
+            )
+            if proc.returncode == 0:
+                return True
+
+        return False
 
     def type_text(self, text: str) -> None:
-        pyautogui.write(text, interval=0.03)
+        if not text:
+            return
+        pyperclip.copy(text)
+        pyautogui.hotkey("ctrl", "v")
 
     def press_hotkey(self, *keys: str) -> None:
         pyautogui.hotkey(*keys)
@@ -103,9 +142,14 @@ class VoiceAssistant:
         image.save(buffer, format="PNG")
         img_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
+        prompt = (
+            "Ты помощник Вовчик. У тебя есть изображение экрана пользователя. "
+            "Отвечай только на русском языке, кратко и по делу. "
+            f"Вопрос пользователя: {question}"
+        )
         payload = {
             "model": self.config.vision_model,
-            "prompt": f"Ответь кратко и по-русски. Вопрос пользователя: {question}",
+            "prompt": prompt,
             "images": [img_b64],
             "stream": False,
         }
@@ -114,37 +158,72 @@ class VoiceAssistant:
             resp = requests.post(self.config.ollama_url, json=payload, timeout=120)
             resp.raise_for_status()
             data = resp.json()
-            return data.get("response", "Не удалось получить ответ от модели.").strip()
+            answer = data.get("response", "Не удалось получить ответ от модели").strip()
+            if not answer:
+                return "Модель не вернула текстовый ответ"
+            return answer
         except Exception as exc:
             return f"Ошибка при анализе экрана: {exc}"
 
     @staticmethod
-    def _extract_screen_question(command: str) -> str:
-        prefixes = ("что на экране", "проанализируй экран")
-        for prefix in prefixes:
-            if command.startswith(prefix):
-                q = command[len(prefix):].strip(" .,!?")
-                return q if q else "Что находится на экране?"
-        return "Что находится на экране?"
+    def _extract_text_after_keywords(command: str, keywords: list[str]) -> str:
+        for keyword in keywords:
+            if keyword in command:
+                suffix = command.split(keyword, 1)[1].strip(" .,!?")
+                if suffix:
+                    return suffix
+        return ""
+
+    def _parse_intent(self, command: str) -> tuple[str, str]:
+        c = self._clean_phrase(command)
+
+        if any(word in c for word in ["выход", "стоп", "заверш", "закрой ассистента"]):
+            return "exit", ""
+
+        if any(word in c for word in ["экран", "скрин", "что видишь", "анализ"]):
+            question = self._extract_text_after_keywords(
+                c,
+                ["что на экране", "проанализируй экран", "посмотри экран", "видишь на экране", "экран"],
+            )
+            return "screen", question or "Что находится на экране?"
+
+        if any(word in c for word in ["переключ", "активируй", "открой окно", "сфокусируй"]):
+            title = self._extract_text_after_keywords(
+                c,
+                ["открой окно", "переключись на", "активируй", "сфокусируй", "открой"],
+            )
+            return "window", title
+
+        if any(word in c for word in ["напечат", "введи", "впиши", "набери"]):
+            text = self._extract_text_after_keywords(c, ["напечатай", "введи", "впиши", "набери"])
+            return "type", text
+
+        if any(word in c for word in ["нажми", "горяч", "комбинац"]):
+            raw = self._extract_text_after_keywords(c, ["нажми", "комбинацию", "горячие клавиши"])
+            return "hotkey", raw
+
+        return "unknown", c
 
     def handle_command(self, command: str) -> None:
-        if command.startswith("открой окно"):
-            title = command.replace("открой окно", "", 1).strip()
-            if title and self.activate_window(title):
-                self.say(f"Окно {title} активировано")
+        intent, value = self._parse_intent(command)
+
+        if intent == "window":
+            if value and self.activate_window(value):
+                self.say(f"Окно {value} активировано")
             else:
-                self.say("Не нашел такое окно")
+                self.say("Не нашел окно. Скажи точнее название приложения")
             return
 
-        if command.startswith("напечатай"):
-            text = command.replace("напечатай", "", 1).strip()
-            self.type_text(text)
-            self.say("Готово")
+        if intent == "type":
+            if not value:
+                self.say("Не расслышал текст для ввода")
+                return
+            self.type_text(value)
+            self.say("Текст вставлен")
             return
 
-        if command.startswith("нажми"):
-            raw = command.replace("нажми", "", 1).strip()
-            keys = tuple(part.strip() for part in raw.split("+") if part.strip())
+        if intent == "hotkey":
+            keys = tuple(part.strip() for part in value.split("+") if part.strip())
             if keys:
                 self.press_hotkey(*keys)
                 self.say("Сделано")
@@ -152,22 +231,21 @@ class VoiceAssistant:
                 self.say("Не понял комбинацию клавиш")
             return
 
-        if command.startswith("что на экране") or command.startswith("проанализируй экран"):
+        if intent == "screen":
             ok, msg = self.check_ollama()
             if not ok:
                 self.say(msg)
                 return
-            question = self._extract_screen_question(command)
-            self.say("Анализирую экран")
-            answer = self.ask_about_screen(question)
+            self.say("Смотрю на экран")
+            answer = self.ask_about_screen(value)
             self.say(answer)
             return
 
-        if command in {"выход", "стоп", "завершить"}:
+        if intent == "exit":
             self.say("Останавливаюсь")
             raise SystemExit(0)
 
-        self.say("Команда не распознана")
+        self.say("Пока не понял команду. Попробуй сказать иначе")
 
     def run(self) -> None:
         self.say("Голосовой ассистент запущен")
@@ -177,12 +255,17 @@ class VoiceAssistant:
                 if not heard:
                     continue
                 print(f"[YOU] {heard}")
+
+                # Можно с wake-word и без него (вольные команды)
                 if self.config.wake_word in heard:
-                    self.say("Слушаю")
-                    command = self.listen(timeout=6, phrase_time_limit=10)
-                    if command:
-                        print(f"[CMD] {command}")
-                        self.handle_command(command)
+                    heard = heard.replace(self.config.wake_word, "", 1).strip()
+                    if not heard:
+                        self.say("Слушаю")
+                        heard = self.listen(timeout=6, phrase_time_limit=10)
+
+                if heard:
+                    print(f"[CMD] {heard}")
+                    self.handle_command(heard)
             except sr.WaitTimeoutError:
                 continue
             except KeyboardInterrupt:

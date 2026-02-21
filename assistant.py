@@ -293,6 +293,23 @@ class VoiceAssistant:
 
         self._last_typed_text = text
 
+        # 1) direct typing first
+        try:
+            pyautogui.write(text, interval=0.01)
+            return True
+        except Exception:
+            pass
+
+        # 2) Shift+Insert fallback
+        if pyperclip is not None:
+            try:
+                pyperclip.copy(text)
+                pyautogui.hotkey("shift", "insert")
+                return True
+            except Exception:
+                pass
+
+        # 3) Ctrl+V last fallback
         if pyperclip is not None:
             try:
                 pyperclip.copy(text)
@@ -300,17 +317,8 @@ class VoiceAssistant:
                 return True
             except Exception:
                 pass
-            try:
-                pyautogui.hotkey("shift", "insert")
-                return True
-            except Exception:
-                pass
 
-        try:
-            pyautogui.write(text, interval=0.01)
-            return True
-        except Exception:
-            return False
+        return False
 
     def delete_typed_text(self, mode: str = "line") -> bool:
         if pyautogui is None:
@@ -438,11 +446,23 @@ class VoiceAssistant:
         data = resp.json().get("data", [])
         return data[0].get("id") if data else None
 
-    def _extract_last_answer(self, text: str) -> str:
+    def _extract_last_answer(self, text: str, question: str) -> str:
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         if not lines:
             return "Ответ в LM Studio не найден"
-        return lines[-1]
+
+        # Try to pick meaningful line not equal to user prompt
+        qn = self._normalize(question)
+        for candidate in reversed(lines):
+            cn = self._normalize(candidate)
+            if not cn:
+                continue
+            if qn and (cn == qn or qn in cn):
+                continue
+            if len(candidate) < 3:
+                continue
+            return candidate
+        return "Ответ в LM Studio не найден"
 
     def ask_ai_via_lmstudio_window(self, question: str) -> str:
         if pyautogui is None or pyperclip is None:
@@ -464,7 +484,7 @@ class VoiceAssistant:
             time.sleep(0.1)
             pyautogui.hotkey("ctrl", "c")
             time.sleep(0.1)
-            return self._extract_last_answer(pyperclip.paste())
+            return self._extract_last_answer(pyperclip.paste(), question)
         except Exception as exc:
             return f"Ручной режим LM Studio не удался: {exc}"
 
@@ -533,7 +553,7 @@ class VoiceAssistant:
 
         if any(w in c for w in ["выход", "стоп", "заверш", "закрой ассистента", "выключи бота"]):
             return "exit", ""
-        if any(w in c for w in ["список окон", "какие окна", "открытые приложения", "открытых приложений", "список приложений"]):
+        if any(w in c for w in ["список окон", "какие окна", "открытые приложения", "открытых приложений", "список приложений", "покажи приложения", "покажи открытые приложения"]):
             return "list_apps", ""
         if any(w in c for w in ["запусти", "стартуй", "открой приложение"]):
             return "launch_app", self._extract_text_after_keywords(c, ["запусти", "стартуй", "открой приложение"])
@@ -640,11 +660,14 @@ class VoiceAssistant:
                 if answer.startswith("Ошибка API") or answer.startswith("В LM Studio нет"):
                     self._set_status("API не сработал, пробую ручной режим")
                     manual = self.ask_ai_via_lmstudio_window(value)
-                    answer = manual if not manual.startswith("Не удалось") else f"{answer}. {manual}"
+                    if manual.startswith("Не удалось") or manual.startswith("Ответ в LM Studio не найден"):
+                        answer = f"{answer}. {manual}"
+                    else:
+                        answer = manual
             else:
                 self._set_status("API недоступен, пробую ручной режим")
                 answer = self.ask_ai_via_lmstudio_window(value)
-                if answer.startswith("Не удалось"):
+                if answer.startswith("Не удалось") or answer.startswith("Ответ в LM Studio не найден"):
                     answer = f"Нет API подключения: {msg}. {answer}"
 
             self.say(answer)
